@@ -24,6 +24,7 @@ module Paranoia
   module Query
     def paranoid? ; true ; end
 
+    # If you want to find all records, even those which are deleted
     def with_deleted
       if ActiveRecord::VERSION::STRING >= "4.1"
         return unscope where: paranoia_column
@@ -31,6 +32,7 @@ module Paranoia
       all.tap { |x| x.default_scoped = false }
     end
 
+    # If you want to find only the deleted records
     def only_deleted
       if paranoia_sentinel_value.nil?
         return with_deleted.where.not(paranoia_column => paranoia_sentinel_value)
@@ -40,11 +42,12 @@ module Paranoia
       # these will not match != sentinel value because "NULL != value" is
       # NULL under the sql standard
       # Scoping with the table_name is mandatory to avoid ambiguous errors when joining tables.
-      scoped_quoted_paranoia_column = "#{self.table_name}.#{connection.quote_column_name(paranoia_column)}"
+      scoped_quoted_paranoia_column = "#{connection.quote_table_name(self.table_name)}.#{connection.quote_column_name(paranoia_column)}"
       with_deleted.where("#{scoped_quoted_paranoia_column} IS NULL OR #{scoped_quoted_paranoia_column} != ?", paranoia_sentinel_value)
     end
     alias_method :deleted, :only_deleted
 
+    # If you want to restore a record
     def restore(id_or_ids, opts = {})
       ids = Array(id_or_ids).flatten
       any_object_instead_of_id = ids.any? { |id| ActiveRecord::Base === id }
@@ -58,9 +61,9 @@ module Paranoia
   end
 
   def paranoia_destroy
-    transaction do
-      run_callbacks(:destroy) do
-        @_disable_counter_cache = deleted?
+    with_transaction_returning_status do
+      result = run_callbacks(:destroy) do
+        @_disable_counter_cache = paranoia_destroyed?
         result = paranoia_delete
         next result unless result && ActiveRecord::VERSION::STRING >= '4.2'
         each_counter_cached_associations do |association|
@@ -69,16 +72,23 @@ module Paranoia
           next unless send(association.reflection.name)
           association.decrement_counters
         end
+        @_trigger_destroy_callback = true
         @_disable_counter_cache = false
         result
       end
-    end
+      raise ActiveRecord::Rollback, "Not destroyed" unless paranoia_destroyed?
+      result
+    end || false
   end
   alias_method :destroy, :paranoia_destroy
 
   def paranoia_destroy!
     paranoia_destroy ||
       raise(ActiveRecord::RecordNotDestroyed.new("Failed to destroy the record", self))
+  end
+
+  def trigger_transactional_callbacks?
+    super || @_trigger_destroy_callback && paranoia_destroyed?
   end
 
   def paranoia_delete
@@ -124,21 +134,21 @@ module Paranoia
   def get_recovery_window_range(opts)
     return opts[:recovery_window_range] if opts[:recovery_window_range]
     return unless opts[:recovery_window]
-    (deleted_at - opts[:recovery_window]..deleted_at + opts[:recovery_window])
+    (deletion_time - opts[:recovery_window]..deletion_time + opts[:recovery_window])
   end
 
   def within_recovery_window?(recovery_window_range)
     return true unless recovery_window_range
-    recovery_window_range.cover?(deleted_at)
+    recovery_window_range.cover?(deletion_time)
   end
 
   def paranoia_destroyed?
-    send(paranoia_column) != paranoia_sentinel_value
+    paranoia_column_value != paranoia_sentinel_value
   end
   alias :deleted? :paranoia_destroyed?
 
-  def really_destroy!
-    transaction do
+  def really_destroy!(update_destroy_attributes: true)
+    with_transaction_returning_status do
       run_callbacks(:real_destroy) do
         @_disable_counter_cache = paranoia_destroyed?
         dependent_reflections = self.class.reflections.select do |name, reflection|
@@ -151,12 +161,14 @@ module Paranoia
             # .paranoid? will work for both instances and classes
             next unless association_data && association_data.paranoid?
             if reflection.collection?
-              next association_data.with_deleted.each(&:really_destroy!)
+              next association_data.with_deleted.find_each { |record|
+                record.really_destroy!(update_destroy_attributes: update_destroy_attributes)
+              }
             end
-            association_data.really_destroy!
+            association_data.really_destroy!(update_destroy_attributes: update_destroy_attributes)
           end
         end
-        update_columns(paranoia_destroy_attributes)
+        update_columns(paranoia_destroy_attributes) if update_destroy_attributes
         destroy_without_paranoia
       end
     end
@@ -164,8 +176,25 @@ module Paranoia
 
   private
 
+  def counter_cache_disabled?
+    defined?(@_disable_counter_cache) && @_disable_counter_cache
+  end
+
+  def counter_cached_association_names
+    return [] if counter_cache_disabled?
+    super
+  end
+
   def each_counter_cached_associations
-    !(defined?(@_disable_counter_cache) && @_disable_counter_cache) ? super : []
+    return [] if counter_cache_disabled?
+
+    if defined?(super)
+      super
+    else
+      counter_cached_association_names.each do |name|
+        yield association(name)
+      end
+    end
   end
 
   def paranoia_restore_attributes
@@ -182,6 +211,16 @@ module Paranoia
 
   def timestamp_attributes_with_current_time
     timestamp_attributes_for_update_in_model.each_with_object({}) { |attr,hash| hash[attr] = current_time_from_proper_timezone }
+  end
+
+  def paranoia_find_has_one_target(association)
+    association_foreign_key = association.options[:through].present? ? association.klass.primary_key : association.foreign_key
+    association_find_conditions = { association_foreign_key => self.id }
+    association_find_conditions[association.type] = self.class.name if association.type
+
+    scope = association.klass.only_deleted.where(association_find_conditions)
+    scope = scope.merge(association.scope) if association.scope
+    scope.first
   end
 
   # restore associated records that have been soft deleted when
@@ -207,31 +246,31 @@ module Paranoia
       end
 
       if association_data.nil? && association.macro.to_s == "has_one"
-        association_class_name = association.klass.name
-        association_foreign_key = association.foreign_key
-
-        if association.type
-          association_polymorphic_type = association.type
-          association_find_conditions = { association_polymorphic_type => self.class.name.to_s, association_foreign_key => self.id }
-        else
-          association_find_conditions = { association_foreign_key => self.id }
-        end
-
-        association_class = association_class_name.constantize
-        if association_class.paranoid?
-          association_class.only_deleted.where(association_find_conditions).first
+        if association.klass.paranoid?
+          paranoia_find_has_one_target(association)
             .try!(:restore, recursive: true, :recovery_window_range => recovery_window_range)
         end
       end
     end
 
-    clear_association_cache if destroyed_associations.present?
+    if ActiveRecord.version.to_s > '7'
+      # Method deleted in https://github.com/rails/rails/commit/dd5886d00a2d5f31ccf504c391aad93deb014eb8
+      @association_cache.clear if persisted? && destroyed_associations.present?
+    else
+      clear_association_cache if destroyed_associations.present?
+    end
   end
 end
 
 ActiveSupport.on_load(:active_record) do
   class ActiveRecord::Base
     def self.acts_as_paranoid(options={})
+      if included_modules.include?(Paranoia)
+        puts "[WARN] #{self.name} is calling acts_as_paranoid more than once!"
+
+        return
+      end
+
       define_model_callbacks :restore, :real_destroy
 
       alias_method :really_destroyed?, :destroyed?
@@ -280,8 +319,16 @@ ActiveSupport.on_load(:active_record) do
       self.class.paranoia_column
     end
 
+    def paranoia_column_value
+      send(paranoia_column)
+    end
+
     def paranoia_sentinel_value
       self.class.paranoia_sentinel_value
+    end
+
+    def deletion_time
+      paranoia_column_value.acts_like?(:time) ? paranoia_column_value : deleted_at
     end
   end
 end
@@ -311,7 +358,7 @@ module ActiveRecord
       def validate_each(record, attribute, value)
         # if association is soft destroyed, add an error
         if value.present? && value.paranoia_destroyed?
-          record.errors[attribute] << 'has been soft-deleted'
+          record.errors.add(attribute, 'has been soft-deleted')
         end
       end
     end
